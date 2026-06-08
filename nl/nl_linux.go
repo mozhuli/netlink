@@ -724,6 +724,8 @@ type NetlinkSocket struct {
 	fd             int32
 	file           *os.File
 	lsa            unix.SockaddrNetlink
+	receiveBuffer  []byte
+	receiveMu      sync.Mutex
 	sendTimeout    int64 // Access using atomic.Load/StoreInt64
 	receiveTimeout int64 // Access using atomic.Load/StoreInt64
 	sync.Mutex
@@ -739,8 +741,9 @@ func getNetlinkSocket(protocol int) (*NetlinkSocket, error) {
 		return nil, err
 	}
 	s := &NetlinkSocket{
-		fd:   int32(fd),
-		file: os.NewFile(uintptr(fd), "netlink"),
+		fd:            int32(fd),
+		file:          os.NewFile(uintptr(fd), "netlink"),
+		receiveBuffer: make([]byte, RECEIVE_BUFFER_SIZE),
 	}
 	s.lsa.Family = unix.AF_NETLINK
 	if err := unix.Bind(fd, &s.lsa); err != nil {
@@ -837,8 +840,9 @@ func Subscribe(protocol int, groups ...uint) (*NetlinkSocket, error) {
 		return nil, err
 	}
 	s := &NetlinkSocket{
-		fd:   int32(fd),
-		file: os.NewFile(uintptr(fd), "netlink"),
+		fd:            int32(fd),
+		file:          os.NewFile(uintptr(fd), "netlink"),
+		receiveBuffer: make([]byte, RECEIVE_BUFFER_SIZE),
 	}
 	s.lsa.Family = unix.AF_NETLINK
 
@@ -922,11 +926,13 @@ func (s *NetlinkSocket) Receive() ([]syscall.NetlinkMessage, *unix.SockaddrNetli
 	var (
 		deadline time.Time
 		fromAddr *unix.SockaddrNetlink
-		rb       [RECEIVE_BUFFER_SIZE]byte
 		nr       int
 		from     unix.Sockaddr
 		innerErr error
 	)
+	s.receiveMu.Lock()
+	defer s.receiveMu.Unlock()
+	rb := s.receiveBuffer
 	receiveTimeout := atomic.LoadInt64(&s.receiveTimeout)
 	if receiveTimeout != 0 {
 		deadline = time.Now().Add(time.Duration(receiveTimeout))

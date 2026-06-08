@@ -724,6 +724,8 @@ type NetlinkSocket struct {
 	fd             int32
 	file           *os.File
 	lsa            unix.SockaddrNetlink
+	receiveBuffer  []byte
+	receiveMu      sync.Mutex
 	sendTimeout    int64 // Access using atomic.Load/StoreInt64
 	receiveTimeout int64 // Access using atomic.Load/StoreInt64
 	sync.Mutex
@@ -739,8 +741,9 @@ func getNetlinkSocket(protocol int) (*NetlinkSocket, error) {
 		return nil, err
 	}
 	s := &NetlinkSocket{
-		fd:   int32(fd),
-		file: os.NewFile(uintptr(fd), "netlink"),
+		fd:            int32(fd),
+		file:          os.NewFile(uintptr(fd), "netlink"),
+		receiveBuffer: newReceiveBuffer(),
 	}
 	s.lsa.Family = unix.AF_NETLINK
 	if err := unix.Bind(fd, &s.lsa); err != nil {
@@ -837,8 +840,9 @@ func Subscribe(protocol int, groups ...uint) (*NetlinkSocket, error) {
 		return nil, err
 	}
 	s := &NetlinkSocket{
-		fd:   int32(fd),
-		file: os.NewFile(uintptr(fd), "netlink"),
+		fd:            int32(fd),
+		file:          os.NewFile(uintptr(fd), "netlink"),
+		receiveBuffer: newReceiveBuffer(),
 	}
 	s.lsa.Family = unix.AF_NETLINK
 
@@ -914,15 +918,13 @@ func (s *NetlinkSocket) Send(request *NetlinkRequest) error {
 	return nil
 }
 
-func (s *NetlinkSocket) Receive() ([]syscall.NetlinkMessage, *unix.SockaddrNetlink, error) {
+func (s *NetlinkSocket) receiveRaw(rb []byte) (int, unix.Sockaddr, error) {
 	rawConn, err := s.file.SyscallConn()
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, err
 	}
 	var (
 		deadline time.Time
-		fromAddr *unix.SockaddrNetlink
-		rb       [RECEIVE_BUFFER_SIZE]byte
 		nr       int
 		from     unix.Sockaddr
 		innerErr error
@@ -932,23 +934,27 @@ func (s *NetlinkSocket) Receive() ([]syscall.NetlinkMessage, *unix.SockaddrNetli
 		deadline = time.Now().Add(time.Duration(receiveTimeout))
 	}
 	if err := s.file.SetReadDeadline(deadline); err != nil {
-		return nil, nil, err
+		return 0, nil, err
 	}
 	err = rawConn.Read(func(fd uintptr) (done bool) {
 		nr, from, innerErr = unix.Recvfrom(int(fd), rb[:], 0)
 		return innerErr != unix.EWOULDBLOCK
 	})
 	if innerErr != nil {
-		return nil, nil, innerErr
+		return 0, nil, innerErr
 	}
 	if err != nil {
 		// The timeout was previously implemented using SO_RCVTIMEO on a blocking
 		// socket. So, continue to return EAGAIN when the timeout is reached.
 		if errors.Is(err, os.ErrDeadlineExceeded) {
-			return nil, nil, unix.EAGAIN
+			return 0, nil, unix.EAGAIN
 		}
-		return nil, nil, err
+		return 0, nil, err
 	}
+	return nr, from, nil
+}
+
+func parseNetlinkReceiveResult(rb []byte, nr int, from unix.Sockaddr) ([]syscall.NetlinkMessage, *unix.SockaddrNetlink, error) {
 	fromAddr, ok := from.(*unix.SockaddrNetlink)
 	if !ok {
 		return nil, nil, fmt.Errorf("Error converting to netlink sockaddr")
@@ -958,7 +964,7 @@ func (s *NetlinkSocket) Receive() ([]syscall.NetlinkMessage, *unix.SockaddrNetli
 	}
 	msgLen := nlmAlignOf(nr)
 	rb2 := make([]byte, msgLen)
-	copy(rb2, rb[:msgLen])
+	copy(rb2, rb[:nr])
 	nl, err := syscall.ParseNetlinkMessage(rb2)
 	if err != nil {
 		return nil, nil, err

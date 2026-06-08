@@ -40,6 +40,13 @@ var SupportedNlFamilies = []int{unix.NETLINK_ROUTE, unix.NETLINK_XFRM, unix.NETL
 
 var nextSeqNr uint32
 
+var receiveBufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, RECEIVE_BUFFER_SIZE)
+		return &b
+	},
+}
+
 // Default netlink socket timeout, 60s
 var SocketTimeoutTv = unix.Timeval{Sec: 60, Usec: 0}
 
@@ -922,11 +929,13 @@ func (s *NetlinkSocket) Receive() ([]syscall.NetlinkMessage, *unix.SockaddrNetli
 	var (
 		deadline time.Time
 		fromAddr *unix.SockaddrNetlink
-		rb       [RECEIVE_BUFFER_SIZE]byte
 		nr       int
 		from     unix.Sockaddr
 		innerErr error
 	)
+	rbp := receiveBufferPool.Get().(*[]byte)
+	rb := *rbp
+	defer receiveBufferPool.Put(rbp)
 	receiveTimeout := atomic.LoadInt64(&s.receiveTimeout)
 	if receiveTimeout != 0 {
 		deadline = time.Now().Add(time.Duration(receiveTimeout))

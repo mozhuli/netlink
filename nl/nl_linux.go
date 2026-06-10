@@ -947,7 +947,8 @@ func parseNetlinkMessage(rb []byte, nr int) ([]syscall.NetlinkMessage, error) {
 	if nr < unix.NLMSG_HDRLEN {
 		return nil, fmt.Errorf("Got short response from netlink")
 	}
-	rb2 := make([]byte, nr)
+	msgLen := nlmAlignOf(nr)
+	rb2 := make([]byte, msgLen)
 	copy(rb2, rb[:nr])
 	return syscall.ParseNetlinkMessage(rb2)
 }
